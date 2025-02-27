@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"math/rand"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -19,7 +22,170 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-func sendTokenApproval(client *ethclient.Client, privateKey *ecdsa.PrivateKey, tokenAddress string, spenderAddress string, amount *big.Int) (string, error) {
+var (
+	spinnerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+	txStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
+	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	waitingStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
+	walletStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("99"))
+	completedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("105"))
+	helpStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Margin(1, 0)
+	appStyle       = lipgloss.NewStyle().Margin(1, 2, 0, 2)
+)
+
+type txResultMsg struct {
+	txHash  string
+	wallet  string
+	index   int
+	success bool
+	err     error
+}
+
+func (r txResultMsg) String() string {
+	if r.success {
+		return fmt.Sprintf("%s Pumped! tx: %s",
+			walletStyle.Render(fmt.Sprintf("Wallet %d", r.index+1)),
+			txStyle.Render(r.txHash))
+	}
+	return errorStyle.Render(fmt.Sprintf("Wallet %d error: %v", r.index+1, r.err))
+}
+
+type waitMsg struct {
+	seconds int
+	reason  string
+}
+
+func (w waitMsg) String() string {
+	return waitingStyle.Render(fmt.Sprintf("Waiting %d seconds - %s", w.seconds, w.reason))
+}
+
+type model struct {
+	spinner    spinner.Model
+	messages   []string
+	processing bool
+	quitting   bool
+}
+
+func newModel() model {
+	const numLastMessages = 10
+	s := spinner.New()
+	s.Style = spinnerStyle
+	return model{
+		spinner:    s,
+		messages:   make([]string, 0, numLastMessages),
+		processing: true,
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return m.spinner.Tick
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		m.quitting = true
+		return m, tea.Quit
+
+	case txResultMsg:
+		m.messages = append([]string{msg.String()}, m.messages...)
+		if len(m.messages) > 20 {
+			m.messages = m.messages[:20]
+		}
+		return m, nil
+
+	case waitMsg:
+		m.messages = append([]string{msg.String()}, m.messages...)
+		if len(m.messages) > 20 {
+			m.messages = m.messages[:20]
+		}
+		return m, nil
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+
+	default:
+		return m, nil
+	}
+}
+
+func (m model) View() string {
+	var s string
+	if m.quitting {
+		s += completedStyle.Render("Transaction process completed!")
+	} else {
+		s += m.spinner.View() + " Processing transactions..."
+	}
+	s += "\n\n"
+	for _, msg := range m.messages {
+		s += msg + "\n"
+	}
+
+	if !m.quitting {
+		s += helpStyle.Render("Press any key to exit")
+	}
+
+	return appStyle.Render(s)
+}
+
+func runTransactions(p *tea.Program, client *ethclient.Client, wallets []string, tokenAddress string, spenderAddress string) {
+	for {
+		for i, pkHex := range wallets {
+			privateKey, err := crypto.HexToECDSA(pkHex)
+			if err != nil {
+				p.Send(txResultMsg{
+					index:   i,
+					wallet:  pkHex[:8] + "...",
+					success: false,
+					err:     fmt.Errorf("failed to parse private key: %v", err),
+				})
+				continue
+			}
+
+			// send tx
+			txHash, err := sendTokenApproval(client, privateKey, tokenAddress, spenderAddress)
+			if err != nil {
+				p.Send(txResultMsg{
+					index:   i,
+					wallet:  pkHex[:8] + "...",
+					success: false,
+					err:     err,
+				})
+				continue
+			}
+
+			// return successful result
+			p.Send(txResultMsg{
+				txHash:  txHash,
+				wallet:  pkHex[:8] + "...",
+				index:   i,
+				success: true,
+			})
+
+			// random delay between wallets
+			if len(wallets) > 1 && i < len(wallets)-1 {
+				randomDelay := 5 + rand.Intn(6)
+				p.Send(waitMsg{
+					seconds: randomDelay,
+					reason:  "before next wallet",
+				})
+				time.Sleep(time.Duration(randomDelay) * time.Second)
+			}
+		}
+
+		// random delay between cycles
+		randomDelay := 5 + rand.Intn(6)
+		p.Send(waitMsg{
+			seconds: randomDelay,
+			reason:  "before next cycle",
+		})
+		time.Sleep(time.Duration(randomDelay) * time.Second)
+	}
+}
+
+func sendTokenApproval(client *ethclient.Client, privateKey *ecdsa.PrivateKey, tokenAddress string, spenderAddress string) (string, error) {
 	ctx := context.Background()
 
 	chainID, err := client.ChainID(ctx)
@@ -32,9 +198,9 @@ func sendTokenApproval(client *ethclient.Client, privateKey *ecdsa.PrivateKey, t
 	if !ok {
 		return "", fmt.Errorf("failed to get public key")
 	}
-
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
 
+	// get nonce
 	nonce, err := client.PendingNonceAt(ctx, fromAddress)
 	if err != nil {
 		return "", fmt.Errorf("failed to get nonce: %v", err)
@@ -51,22 +217,23 @@ func sendTokenApproval(client *ethclient.Client, privateKey *ecdsa.PrivateKey, t
 	}
 	baseFee := header.BaseFee
 
+	// calculate gas fee cap
 	bufferGwei := big.NewInt(30_000_000_000)
 	baseFeeMul := new(big.Int).Mul(baseFee, big.NewInt(2))
 	option1 := new(big.Int).Add(baseFeeMul, gasTipCap)
 	option2 := new(big.Int).Add(gasTipCap, bufferGwei)
 
+	// choose the higher gas fee cap
 	gasFeeCapNew := option1
 	if option2.Cmp(option1) > 0 {
 		gasFeeCapNew = option2
 	}
-
 	gasLimit := uint64(100000)
 
-	_ = common.HexToAddress(spenderAddress)
 	tokenContract := common.HexToAddress(tokenAddress)
 	data := []byte{0x39, 0x5e, 0xa6, 0x1b}
 
+	// create tx
 	tx := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   chainID,
 		Nonce:     nonce,
@@ -78,16 +245,19 @@ func sendTokenApproval(client *ethclient.Client, privateKey *ecdsa.PrivateKey, t
 		Data:      data,
 	})
 
+	// sign tx
 	signedTx, err := types.SignTx(tx, types.NewLondonSigner(chainID), privateKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign transaction: %v", err)
 	}
 
+	// send tx
 	err = client.SendTransaction(ctx, signedTx)
 	if err != nil {
 		return "", fmt.Errorf("failed to send transaction: %v", err)
 	}
 
+	// return tx hash
 	return signedTx.Hash().Hex(), nil
 }
 
@@ -115,21 +285,11 @@ func loadPrivateKeys(filePath string) ([]string, error) {
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	rpcURL := "https://monad-testnet.g.alchemy.com/v2/CLH8wkezJtaijaOWTQEv78CRnIEWKE0H"
 	tokenAddress := "0x8462c247356d7deb7e26160dbfab16b351eef242"
 	spenderAddress := "0x0000000000000000000000000000000000000000"
-
-	amount := new(big.Int)
-	amount.SetString("1000000000000000000", 10)
-
-	fmt.Print("Input delay (seconds): ")
-	var delayInput string
-	fmt.Scanln(&delayInput)
-
-	delay, err := strconv.Atoi(delayInput)
-	if err != nil {
-		log.Fatalf("Invalid delay input: %v", err)
-	}
 
 	privateKeys, err := loadPrivateKeys("pk.txt")
 	if err != nil {
@@ -144,32 +304,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to Ethereum node: %v", err)
 	}
-
 	client := ethclient.NewClient(rpcClient)
 
-	for {
-		for i, pkHex := range privateKeys {
-			privateKey, err := crypto.HexToECDSA(pkHex)
-			if err != nil {
-				log.Printf("Failed to parse private key %d: %v", i+1, err)
-				continue
-			}
+	//run tea
+	p := tea.NewProgram(newModel())
 
-			txHash, err := sendTokenApproval(client, privateKey, tokenAddress, spenderAddress, amount)
-			if err != nil {
-				log.Printf("Failed to send approval transaction from wallet %d: %v", i+1, err)
-				continue
-			}
+	// start tx in seperate goroutiness
+	go runTransactions(p, client, privateKeys, tokenAddress, spenderAddress)
 
-			fmt.Printf("Pumped! tx: %s\n", txHash)
-
-			// sleep between wallets
-			if len(privateKeys) > 1 && i < len(privateKeys)-1 {
-				time.Sleep(time.Duration(delay) * time.Second)
-			}
-		}
-
-		// sleep after full cycle
-		time.Sleep(time.Duration(delay) * time.Second)
+	if _, err := p.Run(); err != nil {
+		fmt.Println("Error running program:", err)
+		os.Exit(1)
 	}
 }
