@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"math/rand"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -84,14 +85,18 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		m.quitting = true
-		return m, tea.Quit
+		if msg.String() == "q" {
+			m.quitting = true
+			return m, tea.Quit
+		}
+		return m, nil
 
 	case txResultMsg:
 		m.messages = append([]string{msg.String()}, m.messages...)
 		if len(m.messages) > 20 {
 			m.messages = m.messages[:20]
 		}
+
 		return m, nil
 
 	case waitMsg:
@@ -113,6 +118,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	var s string
+
 	if m.quitting {
 		s += completedStyle.Render("Transaction process completed!")
 	} else {
@@ -124,10 +130,22 @@ func (m model) View() string {
 	}
 
 	if !m.quitting {
-		s += helpStyle.Render("Press any key to exit")
+		s += helpStyle.Render("Press 'q' to exit")
 	}
 
 	return appStyle.Render(s)
+}
+
+func clearScreen() {
+	switch runtime.GOOS {
+	case "windows":
+		fmt.Print("\033[2J\033[H")
+		fmt.Print("\x1b[3J\x1b[H")
+	case "linux", "darwin":
+		fmt.Print("\033[2J\033[H")
+	default:
+		fmt.Print("\033[2J\033[H")
+	}
 }
 
 func runTransactions(p *tea.Program, client *ethclient.Client, wallets []string, tokenAddress string, spenderAddress string) {
@@ -305,6 +323,9 @@ func main() {
 		log.Fatalf("Failed to connect to Ethereum node: %v", err)
 	}
 	client := ethclient.NewClient(rpcClient)
+
+	//clear screen first
+	clearScreen()
 
 	//run tea
 	p := tea.NewProgram(newModel())
